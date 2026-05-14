@@ -1,45 +1,42 @@
-name: EPG für Deutschland synchronisieren
+name: EPG Sync - Einfach
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: '0 */6 * * *'
-  workflow_dispatch:
 
 jobs:
-  sync-epg:
+  sync:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       
-      - name: EPG herunterladen und aufbereiten
+      - name: EPG herunterladen
         run: |
-          mkdir -p public/epg/de/channels
-          curl -L "https://iptv-org.github.io/epg/guides/de.epg.xml" -o public/epg/de/guide.xml
+          curl -L "https://iptv-org.github.io/epg/guides/de.epg.xml" -o de.xml
+          echo "Download fertig: $(wc -l < de.xml) Zeilen"
           
-          grep -o 'channel id="[^"]*"' public/epg/de/guide.xml | sed 's/channel id="//;s/"//' | while read cid; do
-            safe=$(echo "$cid" | sed 's/[^a-zA-Z0-9._-]/_/g')
-            out="public/epg/de/channels/${safe}.xml"
-            echo '<tv>' > "$out"
-            sed -n "/<channel id=\"$cid\"/,/<\/channel>/p" public/epg/de/guide.xml >> "$out"
-            grep -A 20 "<programme channel=\"$cid\"" public/epg/de/guide.xml | head -50 >> "$out"
-            echo '</tv>' >> "$out"
-            grep -q "<programme" "$out" && gzip -9 -f "$out" || rm -f "$out"
-          done
+      - name: Index erstellen
+        run: |
+          mkdir -p public/epg/de
           
+          # Start des JSON
           echo '{"country":"de","generated":"'$(date -Iseconds)'","channels":[' > public/epg/de/index.json
-          first=true
-          for f in public/epg/de/channels/*.xml.gz; do
-            [ -f "$f" ] || continue
-            id=$(basename "$f" .xml.gz)
-            size=$(stat -c%s "$f")
-            [ "$first" = true ] && first=false || echo ',' >> public/epg/de/index.json
-            echo '{"id":"'$id'","file":"channels/'$(basename "$f")'","size":'$size'}' >> public/epg/de/index.json
-          done
+          
+          # Channel-IDs extrahieren und als JSON-Array speichern
+          grep -o 'channel id="[^"]*"' de.xml | \
+            sed 's/channel id="//;s/"//' | \
+            awk '{print "{\"id\":\""$0"\"}"}' | \
+            paste -sd, - >> public/epg/de/index.json
+          
+          # Ende des JSON
           echo ']}' >> public/epg/de/index.json
           
-          echo "index.json mit $(grep -c '"id"' public/epg/de/index.json) Channels erstellt"
-
-      - name: Deploy zu Cloudflare Pages
+          # Erfolgskontrolle
+          echo "=== Index-Inhalt ==="
+          cat public/epg/de/index.json
+          
+      - name: Deploy
         uses: cloudflare/pages-action@v1
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
