@@ -2,124 +2,152 @@ name: EPG von iptv-org synchronisieren
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # Alle 6 Stunden
-  workflow_dispatch:        # Manuell auslösbar
+    - cron: '0 */6 * * *'   # Alle 6 Stunden
+  workflow_dispatch:         # Manuell auslösbar
 
 jobs:
   sync-epg:
     runs-on: ubuntu-latest
     
     steps:
-      - uses: actions/checkout@v4
-
-      - name: EPG-Daten von iptv-org herunterladen
+      - name: Verzeichnis vorbereiten
         run: |
-          mkdir -p public/epg
-          
-          # Liste der Länder
-          COUNTRIES="de gb us fr it es nl at ch pl"
-          
-          for cc in $COUNTRIES; do
-            echo "📡 Lade EPG für $cc..."
-            
-            # Erstelle Land-Verzeichnis
-            mkdir -p "public/epg/$cc"
-            
-            # Lade die fertige EPG-Datei (XML-Format)
-            curl -L "https://iptv-org.github.io/epg/guides/${cc}.epg.xml" \
-              -o "public/epg/$cc/guide.xml" -w "%{http_code}\n" \
-              2>/dev/null | grep -q "200" && echo "  ✅ guide.xml geladen" || echo "  ⚠️ Keine XML-Datei"
-            
-            # Lade auch den Channel-Index (JSON)
-            curl -L "https://iptv-org.github.io/epg/guides/${cc}.index.json" \
-              -o "public/epg/$cc/index.iptv.json" -w "%{http_code}\n" \
-              2>/dev/null | grep -q "200" && echo "  ✅ index.json geladen" || echo "  ⚠️ Kein Index"
-          done
+          mkdir -p public/epg/de/channels
+          mkdir -p public/epg/gb/channels
+          mkdir -p public/epg/us/channels
 
-      - name: EPG in Channel-Dateien aufteilen
+      - name: EPG für Deutschland herunterladen
         run: |
-          for cc_dir in public/epg/*/; do
-            if [ -f "${cc_dir}guide.xml" ]; then
-              cc=$(basename "$cc_dir")
-              echo "📺 Verarbeite $cc..."
+          echo "📡 Lade deutsches EPG..."
+          
+          # Lade die fertige EPG-Datei von iptv-org
+          curl -L "https://iptv-org.github.io/epg/guides/de.epg.xml" \
+            -o "public/epg/de/guide.xml" \
+            -w "HTTP-Status: %{http_code}\nGröße: %{size_download} Bytes\n"
+          
+          # Prüfe ob Download erfolgreich
+          if [ -f "public/epg/de/guide.xml" ] && [ -s "public/epg/de/guide.xml" ]; then
+            echo "✅ EPG für Deutschland geladen ($(wc -c < public/epg/de/guide.xml) Bytes)"
+            
+            # Extrahiere alle Channel-IDs
+            grep -o 'channel id="[^"]*"' public/epg/de/guide.xml | \
+              sed 's/channel id="//;s/"//' | sort -u > public/epg/de/channels.txt
+            
+            echo "📺 Gefundene Channels: $(wc -l < public/epg/de/channels.txt)"
+            
+            # Für jeden Channel eine eigene Datei erstellen
+            while IFS= read -r channel_id; do
+              safe_id=$(echo "$channel_id" | sed 's/[^a-zA-Z0-9._-]/_/g')
+              output="public/epg/de/channels/${safe_id}.xml"
               
-              mkdir -p "${cc_dir}channels"
+              # XML-Struktur erstellen
+              echo '<?xml version="1.0" encoding="UTF-8"?>' > "$output"
+              echo '<tv>' >> "$output"
               
-              # Extrahiere alle Channel-IDs aus der XML
-              grep -o 'channel id="[^"]*"' "${cc_dir}guide.xml" | \
-                sed 's/channel id="//;s/"//' | sort -u | while read channel_id; do
-                
-                safe_id=$(echo "$channel_id" | sed 's/[^a-zA-Z0-9._-]/_/g')
-                output_file="${cc_dir}channels/${safe_id}.xml"
-                
-                # Schreibe XML-Kopf
-                echo '<?xml version="1.0" encoding="UTF-8"?>' > "$output_file"
-                echo '<tv>' >> "$output_file"
-                
-                # Extrahiere Channel-Info
-                sed -n "/<channel id=\"$channel_id\"/,/<\/channel>/p" "${cc_dir}guide.xml" >> "$output_file"
-                
-                # Extrahiere Programme für diesen Channel (nur heutige und morgige)
-                grep -A 1000 "<programme channel=\"$channel_id\"" "${cc_dir}guide.xml" | \
-                  grep -B 1000 -m 1 '</programme>' >> "$output_file" 2>/dev/null || true
-                
-                echo '</tv>' >> "$output_file"
-                
-                # Komprimiere wenn nicht leer (> 200 Bytes = nur TV-Tag)
-                if [ $(stat -c%s "$output_file") -gt 200 ]; then
-                  gzip -9 -f "$output_file"
+              # Channel-Info extrahieren
+              sed -n "/<channel id=\"$channel_id\"/,/<\/channel>/p" public/epg/de/guide.xml >> "$output"
+              
+              # Programme für heute und morgen extrahieren (max 50 pro Channel)
+              grep -A 20 "<programme channel=\"$channel_id\"" public/epg/de/guide.xml | \
+                head -50 >> "$output" 2>/dev/null || true
+              
+              echo '</tv>' >> "$output"
+              
+              # Nur behalten wenn mindestens ein Programm vorhanden
+              if grep -q "<programme" "$output"; then
+                gzip -9 -f "$output"
+              else
+                rm -f "$output"
+              fi
+            done < public/epg/de/channels.txt
+            
+            # Index.json erstellen
+            cat > public/epg/de/index.json << EOF
+{
+  "country": "de",
+  "generated": "$(date -Iseconds)",
+  "channels": [
+EOF
+            
+            first=true
+            for file in public/epg/de/channels/*.xml.gz; do
+              if [ -f "$file" ]; then
+                channel_id=$(basename "$file" .xml.gz)
+                size=$(stat -c%s "$file")
+                if [ "$first" = true ]; then
+                  first=false
                 else
-                  rm -f "$output_file"
+                  echo "," >> public/epg/de/index.json
                 fi
-              done
-              
-              # Erstelle Index
-              echo '{"country":"'$cc'","generated":"'$(date -Iseconds)'","channels":[' > "${cc_dir}index.json"
-              first=true
-              for file in ${cc_dir}channels/*.xml.gz; do
-                if [ -f "$file" ]; then
-                  channel_id=$(basename "$file" .xml.gz)
-                  size=$(stat -c%s "$file")
-                  if [ "$first" = true ]; then first=false; else echo ',' >> "${cc_dir}index.json"; fi
-                  echo '{"id":"'$channel_id'","file":"channels/'$(basename "$file")'","size":'$size'}' >> "${cc_dir}index.json"
-                fi
-              done
-              echo ']}' >> "${cc_dir}index.json"
-              
-              channel_count=$(grep -c '"id"' "${cc_dir}index.json" || echo "0")
-              echo "  ✅ $cc: $channel_count Kanäle"
-            fi
-          done
+                echo "    {\"id\":\"$channel_id\",\"file\":\"channels/$(basename "$file")\",\"size\":$size}" >> public/epg/de/index.json
+              fi
+            done
+            
+            echo "  ]\n}" >> public/epg/de/index.json
+            
+            # Statistik anzeigen
+            channel_count=$(find public/epg/de/channels -name "*.xml.gz" | wc -l)
+            echo "✅ $channel_count Kanäle mit EPG-Daten"
+            
+          else
+            echo "❌ Download fehlgeschlagen"
+            exit 1
+          fi
+
+      - name: EPG für Großbritannien herunterladen (Beispiel)
+        run: |
+          echo "📡 Lade britisches EPG..."
+          curl -L "https://iptv-org.github.io/epg/guides/gb.epg.xml" \
+            -o "public/epg/gb/guide.xml" \
+            -w "HTTP-Status: %{http_code}\n" 2>/dev/null
+          
+          if [ -f "public/epg/gb/guide.xml" ] && [ -s "public/epg/gb/guide.xml" ]; then
+            # Vereinfachte Verarbeitung (nur Index, keine Einzeldateien)
+            grep -o 'channel id="[^"]*"' public/epg/gb/guide.xml | \
+              sed 's/channel id="//;s/"//' | sort -u | while read cid; do
+              echo "{\"id\":\"$cid\"}"
+            done | jq -s '{country:"gb","generated":"'$(date -Iseconds)'","channels":.}' \
+              > public/epg/gb/index.json
+            echo "✅ GB EPG verarbeitet"
+          fi
 
       - name: Globalen Index erstellen
         run: |
-          echo '{"countries":[],"generated":"'$(date -Iseconds)'"}' > public/epg/index.json
+          cat > public/epg/index.json << EOF
+{
+  "generated": "$(date -Iseconds)",
+  "countries": [
+EOF
           
-          for cc_dir in public/epg/*/; do
-            if [ -f "${cc_dir}index.json" ]; then
-              cc=$(basename "$cc_dir")
-              channels=$(jq '.channels | length' "${cc_dir}index.json" 2>/dev/null || echo "0")
-              
-              jq --arg cc "$cc" --argjson ch "$channels" \
-                '.countries += [{"code":$cc,"channels":$ch}]' \
-                public/epg/index.json > public/epg/index.tmp && \
-                mv public/epg/index.tmp public/epg/index.json
+          first=true
+          for cc in public/epg/*/; do
+            if [ -f "${cc}index.json" ] && [ "$(basename "$cc")" != "epg" ]; then
+              cc_name=$(basename "$cc")
+              channel_count=$(jq '.channels | length' "${cc}index.json" 2>/dev/null || echo "0")
+              if [ "$first" = true ]; then
+                first=false
+              else
+                echo "," >> public/epg/index.json
+              fi
+              echo "    {\"code\":\"$cc_name\",\"channels\":$channel_count}" >> public/epg/index.json
             fi
           done
           
-          echo "📊 Globaler Index erstellt:"
-          cat public/epg/index.json | jq '.countries'
+          echo "  ]\n}" >> public/epg/index.json
+          
+          echo "📊 Globaler Index:"
+          cat public/epg/index.json | jq '.'
 
-      - name: Debug - Struktur anzeigen
+      - name: Struktur anzeigen
         run: |
-          echo "=== EPG-Struktur ==="
-          for cc in public/epg/*/; do
-            cc_name=$(basename "$cc")
-            channel_count=$(ls -1 ${cc}channels/*.xml.gz 2>/dev/null | wc -l || echo "0")
-            echo "  $cc_name: $channel_count Kanäle"
-          done
+          echo "=== EPG-Dateistruktur ==="
+          echo "Deutschland: $(find public/epg/de/channels -name "*.xml.gz" 2>/dev/null | wc -l) Channel-Dateien"
+          echo "Gesamtgröße: $(du -sh public/epg 2>/dev/null | cut -f1)"
           echo ""
-          echo "Gesamtgröße: $(du -sh public/epg | cut -f1)"
+          echo "Beispiel-Channel (erste 3):"
+          ls public/epg/de/channels/*.xml.gz 2>/dev/null | head -3 | while read f; do
+            echo "  - $(basename "$f") ($(stat -c%s "$f" 2>/dev/null) Bytes)"
+          done
 
       - name: Zu Cloudflare Pages deployen
         uses: cloudflare/pages-action@v1
