@@ -1,4 +1,4 @@
-name: EPG Sync (JSON)
+name: EPG Sync - XML Parser
 
 on:
   workflow_dispatch:
@@ -11,21 +11,57 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: EPG als JSON herunterladen
+      - name: EPG herunterladen
         run: |
           mkdir -p public/epg/de
+          curl -L "https://iptv-org.github.io/epg/guides/de.epg.xml" -o de.xml
+          echo "Download: $(wc -c < de.xml) Bytes"
+          echo "Erste 200 Zeichen:"
+          head -c 200 de.xml
           
-          # Lade den Channel-Index (Liste aller Sender mit EPG)
-          curl -L "https://iptv-org.github.io/epg/guides/de.index.json" -o public/epg/de/index.raw.json
+      - name: Channel-IDs extrahieren (Python)
+        run: |
+          python3 << 'EOF'
+          import re, json, gzip, os
+          from datetime import datetime
           
-          # Konvertiere in das von Ihrer App erwartete Format
-          jq '{country:"de", generated:"'$(date -Iseconds)'", channels: [.[] | {id: .id}]}' \
-            public/epg/de/index.raw.json > public/epg/de/index.json
+          # XML einlesen
+          with open('de.xml', 'r', encoding='utf-8', errors='ignore') as f:
+              content = f.read()
           
-          echo "Erstellter Index:"
-          cat public/epg/de/index.json
+          # Alle Channel-IDs extrahieren
+          channel_ids = re.findall(r'channel id="([^"]+)"', content)
+          channel_ids = list(dict.fromkeys(channel_ids))  # Duplikate entfernen
           
-      - name: Deploy
+          print(f"Gefunden: {len(channel_ids)} Channels")
+          print("Beispiele:", channel_ids[:5])
+          
+          # Output-Verzeichnis
+          os.makedirs('public/epg/de', exist_ok=True)
+          
+          # Index.json erstellen
+          index = {
+              "country": "de",
+              "generated": datetime.now().isoformat(),
+              "channels": [{"id": cid} for cid in channel_ids]
+          }
+          
+          with open('public/epg/de/index.json', 'w') as f:
+              json.dump(index, f, indent=2)
+          
+          print(f"\n✅ Index mit {len(channel_ids)} Channels erstellt")
+          EOF
+          
+      - name: Ergebnis prüfen
+        run: |
+          echo "=== Index.json ==="
+          cat public/epg/de/index.json | head -30
+          
+          echo ""
+          echo "=== Dateien ==="
+          ls -la public/epg/de/
+          
+      - name: Deploy zu Cloudflare Pages
         uses: cloudflare/pages-action@v1
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
