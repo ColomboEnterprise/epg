@@ -2,194 +2,174 @@ name: EPG pro Land generieren
 
 on:
   schedule:
-    - cron: '0 3 * * *'
+    - cron: '0 */6 * * *'  # Alle 6 Stunden
   workflow_dispatch:
     inputs:
       country_code:
-        description: 'Ländercode (z.B. de, us, gb) oder "all" für alle'
+        description: 'Ländercode'
         required: false
         default: 'de'
       days:
-        description: 'Anzahl Tage (1-7)'
+        description: 'Tage (1-7)'
         required: false
         default: '3'
 
-env:
-  MAX_CONNECTIONS: 3
-  TIMEOUT: 60000
-
 jobs:
-  # ─── Job 1: Matrix vorbereiten ───────────────────────────────────────
-  prepare:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - id: set-matrix
-        run: |
-          INPUT="${{ github.event.inputs.country_code || 'de' }}"
-          if [ "$INPUT" = "all" ]; then
-            COUNTRIES="de,gb,us,fr,it,es,nl,at,ch,pl,tr,br,au,jp,se,no,dk,fi,pt,be,ie"
-          else
-            COUNTRIES="$INPUT"
-          fi
-          JSON=$(echo "$COUNTRIES" | tr ',' '\n' \
-            | sed 's/^/"/;s/$/"/' | tr '\n' ',' \
-            | sed 's/,$//' | sed 's/^/[/;s/$/]/')
-          echo "matrix={\"country\":$JSON}" >> "$GITHUB_OUTPUT"
-          echo "Generiere EPG für: $JSON"
-
-  # ─── Job 2: Pro Land EPG generieren ──────────────────────────────────
   generate:
-    needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    strategy:
-      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
-      max-parallel: 4
-      fail-fast: false
-
+    timeout-minutes: 30
+    
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
+      - name: EPG-Tools installieren
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xmlstarlet jq
+          
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
-      - name: iptv-org/epg klonen
+      - name: iptv-org/epg Repository klonen
         run: |
-          git clone --depth 1 https://github.com/iptv-org/epg.git
-          cd epg && npm install
+          git clone https://github.com/iptv-org/epg.git
+          cd epg
+          npm install
+          npm run build
 
-      - name: Sites ermitteln
-        id: find-sites
+      - name: Verfügbare Sites prüfen
+        id: check_sites
         run: |
-          CC="${{ matrix.country }}"
-          SITES=$(cd epg && ls sites/ 2>/dev/null | grep -E "\.${CC}$|\.${CC}\." | head -5 || true)
-          case "$CC" in
-            de) FALLBACK="sky.de web.magentatv.de zattoo.com.de" ;;
-            gb) FALLBACK="sky.co.uk bbc.co.uk" ;;
-            us) FALLBACK="pluto.tv.us directv.com" ;;
-            fr) FALLBACK="canalplus.fr sfr.fr" ;;
-            it) FALLBACK="sky.it rai.it" ;;
-            es) FALLBACK="movistar.es" ;;
-            nl) FALLBACK="npo.nl" ;;
-            at) FALLBACK="simpletv.at" ;;
-            *)  FALLBACK="" ;;
-          esac
-          SITES="$SITES $FALLBACK"
-          VALID=""
+          cd epg
+          echo "Verfügbare Sites für de:"
+          ls sites/ | grep -E "\.de$" | head -10
+          
+          # Teste ob Site funktioniert
+          SITES="sky.de magentatv.de zattoo.com.de waipu.tv"
+          WORKING=""
+          
           for site in $SITES; do
-            site=$(echo "$site" | xargs)
-            [ -z "$site" ] && continue
-            if [ -d "epg/sites/$site" ]; then
-              VALID="$VALID $site"
-              echo "✅ $site"
+            if [ -d "sites/$site" ]; then
+              echo "✅ $site verfügbar"
+              WORKING="$WORKING $site"
             else
-              echo "⏭️  $site nicht verfügbar"
+              echo "❌ $site nicht verfügbar"
             fi
           done
-          VALID=$(echo "$VALID" | xargs)
-          echo "sites=$VALID" >> "$GITHUB_OUTPUT"
+          echo "working_sites=$WORKING" >> $GITHUB_OUTPUT
 
-      - name: EPG grabben
-        run: |
-          CC="${{ matrix.country }}"
-          SITES="${{ steps.find-sites.outputs.sites }}"
-          DAYS="${{ github.event.inputs.days || '3' }}"
-          mkdir -p "output/epg/$CC"
-          if [ -z "$SITES" ]; then
-            echo "{\"country\":\"$CC\",\"channels\":[],\"generated\":\"$(date -Iseconds)\"}" \
-              > "output/epg/$CC/index.json"
-            exit 0
-          fi
-          for site in $SITES; do
-            echo "📡 Grabbing: $site"
-            cd epg
-            timeout 600 npm run grab -- \
-              --site="$site" \
-              --output="../output/epg/$CC/${site}.xml" \
-              --days="$DAYS" \
-              --maxConnections="$MAX_CONNECTIONS" \
-              --timeout="$TIMEOUT" \
-              2>&1 | tail -20 || echo "⚠️ Fehler bei $site"
-            cd ..
-            if [ -f "output/epg/$CC/${site}.xml" ]; then
-              gzip -9 -f "output/epg/$CC/${site}.xml"
-              echo "📦 $(wc -c < "output/epg/$CC/${site}.xml.gz") Bytes"
-            fi
-            sleep 3
-          done
-
-      - name: EPG nach Sendern aufteilen
+      - name: EPG-Daten grabben
         env:
-          CC: ${{ matrix.country }}
-        run: python3 scripts/split_epg.py
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: epg-${{ matrix.country }}
-          path: output/epg/${{ matrix.country }}/
-          retention-days: 1
-          if-no-files-found: warn
-
-  # ─── Job 3: Deploy zu Cloudflare Pages ───────────────────────────────
-  deploy:
-    needs: generate
-    runs-on: ubuntu-latest
-    if: always()
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: epg-*
-          path: artifacts/
-          merge-multiple: false
-
-      - name: Artefakte zusammenführen
+          CC: ${{ github.event.inputs.country_code || 'de' }}
+          DAYS: ${{ github.event.inputs.days || '3' }}
         run: |
-          mkdir -p public/epg
-          for dir in artifacts/epg-*/; do
-            [ -d "$dir" ] || continue
-            cc=$(basename "$dir" | sed 's/epg-//')
-            mv "$dir" "public/epg/$cc"
-            echo "✅ $cc verschoben"
+          mkdir -p output/epg/$CC
+          
+          cd epg
+          SITES="${{ steps.check_sites.outputs.working_sites }}"
+          
+          for site in $SITES; do
+            echo "📡 Grabbing $site für $DAYS Tage..."
+            
+            # Direkter Aufruf ohne output-Parameter - verwendet Standard-Verzeichnis
+            timeout 600 node dist/cli.js grab \
+              --site="$site" \
+              --days="$DAYS" \
+              --maxConnections=2 || echo "⚠️ Grab fehlgeschlagen für $site"
+            
+            # Kopiere erzeugte Dateien
+            if [ -f "guide.xml" ]; then
+              cp guide.xml "../output/epg/$CC/${site}.xml"
+              echo "✅ $site: $(wc -l < ../output/epg/$CC/${site}.xml) Zeilen"
+            fi
+            
+            sleep 5
+          done
+          cd ..
+
+      - name: XML in Sendungen aufteilen
+        if: success()
+        run: |
+          CC="${{ github.event.inputs.country_code || 'de' }}"
+          
+          for xmlfile in output/epg/$CC/*.xml; do
+            if [ -f "$xmlfile" ]; then
+              echo "Verarbeite $(basename $xmlfile)..."
+              
+              # Extrahiere Programme pro Channel mit xmlstarlet
+              channels=$(xmlstarlet sel -t -v "//channel/@id" "$xmlfile" 2>/dev/null | tr '\n' ' ')
+              
+              for channel in $channels; do
+                safe_id=$(echo "$channel" | sed 's/[^a-zA-Z0-9._-]/_/g')
+                output_file="output/epg/$CC/channels/${safe_id}.xml"
+                
+                mkdir -p "output/epg/$CC/channels"
+                
+                # Extrahiere Programme für diesen Channel
+                xmlstarlet sel -t \
+                  -c "//channel[@id='$channel']" \
+                  -c "//programme[@channel='$channel']" \
+                  "$xmlfile" > "$output_file" 2>/dev/null
+                
+                # Komprimiere wenn nicht leer
+                if [ -s "$output_file" ]; then
+                  gzip -9 -f "$output_file"
+                  echo "  📺 $channel: $(gzip -l ${output_file}.gz | awk 'NR==2 {print $2}') Bytes"
+                fi
+              done
+            fi
           done
 
-      - name: Globalen Index erstellen
-        run: python3 scripts/build_index.py
-
-      - name: Struktur anzeigen
+      - name: Index erstellen
         run: |
-          find public/epg -name "index.json" | while read f; do
-            cc=$(dirname "$f" | xargs basename)
-            n=$(python3 -c "import json; print(len(json.load(open('$f')).get('channels',[])))" 2>/dev/null || echo "?")
-            echo "  🌍 $cc: $n Sender"
-          done
-          echo "📊 $(find public/epg -name '*.xml.gz' | wc -l) Dateien, $(du -sh public/epg | cut -f1)"
+          CC="${{ github.event.inputs.country_code || 'de' }}"
+          CHANNELS_DIR="output/epg/$CC/channels"
+          INDEX_FILE="output/epg/$CC/index.json"
+          
+          if [ -d "$CHANNELS_DIR" ]; then
+            echo '{"country":"'$CC'","generated":"'$(date -Iseconds)'","channels":[' > "$INDEX_FILE"
+            
+            first=true
+            for file in $CHANNELS_DIR/*.xml.gz; do
+              if [ -f "$file" ]; then
+                filename=$(basename "$file")
+                channel_id=$(echo "$filename" | sed 's/\.xml\.gz$//')
+                size=$(stat -c%s "$file")
+                
+                if [ "$first" = true ]; then
+                  first=false
+                else
+                  echo ',' >> "$INDEX_FILE"
+                fi
+                
+                echo -n '{"id":"'$channel_id'","file":"channels/'$filename'","size":'$size'}' >> "$INDEX_FILE"
+              fi
+            done
+            
+            echo ']}' >> "$INDEX_FILE"
+            echo "✅ Index erstellt: $(grep -c 'id' $INDEX_FILE) Kanäle"
+          else
+            echo '{"country":"'$CC'","generated":"'$(date -Iseconds)'","channels":[]}' > "$INDEX_FILE"
+            echo "⚠️ Keine Channel-Dateien gefunden"
+          fi
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Wrangler installieren
-        run: npm install -g wrangler
+      - name: Debug - Zeige Struktur
+        run: |
+          echo "=== Output Struktur ==="
+          find output/epg -type f -name "*.xml.gz" | head -10
+          echo ""
+          echo "=== Index Inhalt ==="
+          cat output/epg/*/index.json 2>/dev/null | head -50
 
       - name: Zu Cloudflare Pages deployen
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          if [ -d "public/epg" ] && [ "$(ls -A public/epg 2>/dev/null)" ]; then
-            wrangler pages deploy public \
-              --project-name="iptv-epg-data" \
-              --branch=main \
-              --commit-dirty=true
-          else
-            echo "⚠️ Nichts zu deployen"
-          fi
+        if: success()
+        uses: cloudflare/pages-action@v1
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          projectName: iptv-epg-data
+          directory: output
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
