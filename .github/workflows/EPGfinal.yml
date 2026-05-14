@@ -1,4 +1,4 @@
-name: EPG Sync - Einfach
+name: EPG Sync (JSON)
 
 on:
   workflow_dispatch:
@@ -11,29 +11,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: EPG herunterladen
-        run: |
-          curl -L "https://iptv-org.github.io/epg/guides/de.epg.xml" -o de.xml
-          echo "Download fertig: $(wc -l < de.xml) Zeilen"
-          
-      - name: Index erstellen
+      - name: EPG als JSON herunterladen
         run: |
           mkdir -p public/epg/de
           
-          # Start des JSON
-          echo '{"country":"de","generated":"'$(date -Iseconds)'","channels":[' > public/epg/de/index.json
+          # Lade den Channel-Index (Liste aller Sender mit EPG)
+          curl -L "https://iptv-org.github.io/epg/guides/de.index.json" -o public/epg/de/index.raw.json
           
-          # Channel-IDs extrahieren und als JSON-Array speichern
-          grep -o 'channel id="[^"]*"' de.xml | \
-            sed 's/channel id="//;s/"//' | \
-            awk '{print "{\"id\":\""$0"\"}"}' | \
-            paste -sd, - >> public/epg/de/index.json
+          # Konvertiere in das von Ihrer App erwartete Format
+          jq '{country:"de", generated:"'$(date -Iseconds)'", channels: [.[] | {id: .id}]}' \
+            public/epg/de/index.raw.json > public/epg/de/index.json
           
-          # Ende des JSON
-          echo ']}' >> public/epg/de/index.json
-          
-          # Erfolgskontrolle
-          echo "=== Index-Inhalt ==="
+          echo "Erstellter Index:"
           cat public/epg/de/index.json
           
       - name: Deploy
