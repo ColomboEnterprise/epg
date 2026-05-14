@@ -1,4 +1,4 @@
-name: EPG Sync - XML Parser
+name: EPG für mehrere Länder
 
 on:
   workflow_dispatch:
@@ -6,62 +6,71 @@ on:
     - cron: '0 */6 * * *'
 
 jobs:
-  sync:
+  generate-all:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        country: [de, gb, us, fr, it, es, nl, at, ch]
     steps:
       - uses: actions/checkout@v4
       
-      - name: EPG herunterladen
+      - name: EPG für ${{ matrix.country }} generieren
         run: |
-          mkdir -p public/epg/de
-          curl -L "https://iptv-org.github.io/epg/guides/de.epg.xml" -o de.xml
-          echo "Download: $(wc -c < de.xml) Bytes"
-          echo "Erste 200 Zeichen:"
-          head -c 200 de.xml
+          mkdir -p public/epg/${{ matrix.country }}/channels
           
-      - name: Channel-IDs extrahieren (Python)
-        run: |
-          python3 << 'EOF'
+          curl -L "https://iptv-org.github.io/epg/guides/${{ matrix.country }}.epg.xml" -o ${{ matrix.country }}.xml
+          
+          python3 << PYTHON_SCRIPT
           import re, json, gzip, os
           from datetime import datetime
+          from xml.etree import ElementTree as ET
           
-          # XML einlesen
-          with open('de.xml', 'r', encoding='utf-8', errors='ignore') as f:
-              content = f.read()
+          country = "${{ matrix.country }}"
+          print(f"📡 Verarbeite {country}...")
           
-          # Alle Channel-IDs extrahieren
-          channel_ids = re.findall(r'channel id="([^"]+)"', content)
-          channel_ids = list(dict.fromkeys(channel_ids))  # Duplikate entfernen
+          tree = ET.parse(f'{country}.xml')
+          root = tree.getroot()
           
-          print(f"Gefunden: {len(channel_ids)} Channels")
-          print("Beispiele:", channel_ids[:5])
+          programmes_by_channel = {}
+          for programme in root.findall('programme'):
+              cid = programme.get('channel', '')
+              if not cid:
+                  continue
+              prog_data = {
+                  'c': cid,
+                  't': programme.find('title').text if programme.find('title') is not None else 'Unbekannt',
+                  's': programme.get('start', ''),
+                  'e': programme.get('stop', ''),
+                  'd': programme.find('desc').text if programme.find('desc') is not None else None,
+                  'cat': programme.find('category').text if programme.find('category') is not None else None
+              }
+              programmes_by_channel.setdefault(cid, []).append(prog_data)
           
-          # Output-Verzeichnis
-          os.makedirs('public/epg/de', exist_ok=True)
+          index = {"country": country, "generated": datetime.now().isoformat(), "channels": []}
           
-          # Index.json erstellen
-          index = {
-              "country": "de",
-              "generated": datetime.now().isoformat(),
-              "channels": [{"id": cid} for cid in channel_ids]
-          }
+          for cid, progs in programmes_by_channel.items():
+              if not progs:
+                  continue
+              safe_id = re.sub(r'[^a-zA-Z0-9._-]', '_', cid)
+              file_path = f'public/epg/{country}/channels/{safe_id}.json.gz'
+              
+              with gzip.open(file_path, 'wt', encoding='utf-8') as f:
+                  json.dump(progs, f, ensure_ascii=False)
+              
+              index['channels'].append({
+                  "id": cid,
+                  "file": f"channels/{safe_id}.json.gz",
+                  "size": os.path.getsize(file_path),
+                  "programs": len(progs)
+              })
           
-          with open('public/epg/de/index.json', 'w') as f:
+          with open(f'public/epg/{country}/index.json', 'w') as f:
               json.dump(index, f, indent=2)
           
-          print(f"\n✅ Index mit {len(channel_ids)} Channels erstellt")
-          EOF
+          print(f"✅ {country}: {len(index['channels'])} Channels")
+          PYTHON_SCRIPT
           
-      - name: Ergebnis prüfen
-        run: |
-          echo "=== Index.json ==="
-          cat public/epg/de/index.json | head -30
-          
-          echo ""
-          echo "=== Dateien ==="
-          ls -la public/epg/de/
-          
-      - name: Deploy zu Cloudflare Pages
+      - name: Deploy
         uses: cloudflare/pages-action@v1
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
