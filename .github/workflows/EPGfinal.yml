@@ -1,79 +1,58 @@
-name: EPG für mehrere Länder
+name: EPG für DE testen
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 */6 * * *'
 
 jobs:
-  generate-all:
+  test-de:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        country: [de, gb, us, fr, it, es, nl, at, ch]
     steps:
       - uses: actions/checkout@v4
       
-      - name: EPG für ${{ matrix.country }} generieren
+      - name: EPG für DE generieren
         run: |
-          mkdir -p public/epg/${{ matrix.country }}/channels
+          mkdir -p public/epg/de/channels
+          curl -L "https://iptv-org.github.io/epg/guides/de.epg.xml" -o de.xml
           
-          curl -L "https://iptv-org.github.io/epg/guides/${{ matrix.country }}.epg.xml" -o ${{ matrix.country }}.xml
-          
-          python3 << PYTHON_SCRIPT
-          import re, json, gzip, os
+          python3 << 'EOF'
+          import re, json, gzip, os, html
           from datetime import datetime
-          from xml.etree import ElementTree as ET
           
-          country = "${{ matrix.country }}"
-          print(f"📡 Verarbeite {country}...")
+          with open('de.xml', 'r', encoding='utf-8', errors='ignore') as f:
+              content = html.unescape(f.read())
           
-          tree = ET.parse(f'{country}.xml')
-          root = tree.getroot()
+          # Suche nach Programmen
+          pattern = r'<programme channel="([^"]+)" start="([^"]+)" stop="([^"]+)".*?<title>([^<]+)</title>'
+          programmes = []
           
-          programmes_by_channel = {}
-          for programme in root.findall('programme'):
-              cid = programme.get('channel', '')
-              if not cid:
-                  continue
-              prog_data = {
-                  'c': cid,
-                  't': programme.find('title').text if programme.find('title') is not None else 'Unbekannt',
-                  's': programme.get('start', ''),
-                  'e': programme.get('stop', ''),
-                  'd': programme.find('desc').text if programme.find('desc') is not None else None,
-                  'cat': programme.find('category').text if programme.find('category') is not None else None
-              }
-              programmes_by_channel.setdefault(cid, []).append(prog_data)
-          
-          index = {"country": country, "generated": datetime.now().isoformat(), "channels": []}
-          
-          for cid, progs in programmes_by_channel.items():
-              if not progs:
-                  continue
-              safe_id = re.sub(r'[^a-zA-Z0-9._-]', '_', cid)
-              file_path = f'public/epg/{country}/channels/{safe_id}.json.gz'
-              
-              with gzip.open(file_path, 'wt', encoding='utf-8') as f:
-                  json.dump(progs, f, ensure_ascii=False)
-              
-              index['channels'].append({
-                  "id": cid,
-                  "file": f"channels/{safe_id}.json.gz",
-                  "size": os.path.getsize(file_path),
-                  "programs": len(progs)
+          for match in re.finditer(pattern, content, re.DOTALL):
+              programmes.append({
+                  "c": match.group(1),
+                  "s": match.group(2),
+                  "e": match.group(3),
+                  "t": match.group(4).strip()
               })
           
-          with open(f'public/epg/{country}/index.json', 'w') as f:
+          print(f"Gefundene Programme: {len(programmes)}")
+          
+          # Channels zählen
+          channels = set(p["c"] for p in programmes)
+          print(f"Channels: {len(channels)}")
+          print("Beispiele:", list(channels)[:10])
+          
+          # Index erstellen
+          index = {
+              "country": "de",
+              "generated": datetime.now().isoformat(),
+              "channels": [{"id": c} for c in channels][:50]
+          }
+          
+          os.makedirs('public/epg/de', exist_ok=True)
+          with open('public/epg/de/index.json', 'w') as f:
               json.dump(index, f, indent=2)
           
-          print(f"✅ {country}: {len(index['channels'])} Channels")
-          PYTHON_SCRIPT
+          print(f"\n✅ Index mit {len(index['channels'])} Channels")
+          EOF
           
-      - name: Deploy
-        uses: cloudflare/pages-action@v1
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          projectName: iptv-epg-data
-          directory: public
+      - name: Ergebnis zeigen
+        run: cat public/epg/de/index.json
